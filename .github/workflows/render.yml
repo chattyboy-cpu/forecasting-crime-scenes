@@ -1,0 +1,65 @@
+name: Render GAM Report
+
+# Run on every push to main (or a PR targeting main).
+# This installs R, knits GAM.Rmd to HTML, and uploads the result
+# as a downloadable workflow artefact.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  render:
+    name: Knit GAM.Rmd → HTML
+    runs-on: ubuntu-latest
+    # This job only reads the repository contents; no write access is needed.
+    permissions:
+      contents: read
+
+    steps:
+      # 1. Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Install R (latest release)
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "release"
+
+      # 3. Install Pandoc (required by rmarkdown to produce HTML)
+      - name: Set up Pandoc
+        uses: r-lib/actions/setup-pandoc@v2
+
+      # 4. Cache the R package library to speed up subsequent runs
+      - name: Cache R packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.R_LIBS_USER }}
+          key: ${{ runner.os }}-r-release-${{ hashFiles('**/DESCRIPTION') }}
+          restore-keys: |
+            ${{ runner.os }}-r-release-
+
+      # 5. Install the packages used by GAM.Rmd
+      - name: Install R packages
+        run: |
+          install.packages(c(
+            "rmarkdown",   # render Rmd → HTML
+            "knitr",       # code-chunk execution engine
+            "tidyverse",   # data wrangling (dplyr, tidyr, readr, ggplot2 …)
+            "mgcv"         # Generalized Additive Models
+          ))
+        shell: Rscript {0}
+
+      # 6. Knit the notebook — errors fail the workflow
+      - name: Render GAM.Rmd
+        run: Rscript -e "rmarkdown::render('GAM.Rmd', output_file = 'GAM.html')"
+
+      # 7. Upload the rendered HTML so it can be downloaded from the Actions UI
+      - name: Upload rendered HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: GAM-report
+          path: GAM.html
+          if-no-files-found: error

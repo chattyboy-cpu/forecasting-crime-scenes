@@ -1,131 +1,255 @@
 ---
-title: "Generative Additive Model"
-author: ',Chatty'
-date: "2026-03-14"
-output: html_document
+title: "Generalized Additive Model for Crime Forecasting"
+author: "Chatty"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+# Global chunk options: echo = TRUE shows all code in the rendered output
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
-```{r}
-# Load required libraries
+
+## Overview
+
+This notebook fits a **Generalized Additive Model (GAM)** to crime incident data.
+The goal is to estimate the probability of a crime occurring at a given
+spatial location (grid cell) and time, while accounting for day-of-study trends
+and cyclic time-of-day patterns.
+
+The three smooth terms used are:
+
+* `te(grid_longitude, grid_latitude)` — a 2-D tensor-product spline that
+  captures spatial crime hotspots.
+* `s(day_of_crime)` — a thin-plate spline that captures the overall temporal
+  trend across the study period.
+* `s(grid_time, bs = "cc")` — a **cyclic cubic spline** that models the
+  time-of-day effect so that midnight (hour 0) and the end of the day
+  (hour 24) join smoothly.
+
+---
+
+## 1 — Setup
+
+```{r libraries}
+# Core data-wrangling and visualisation
 library(tidyverse)
-library(dplyr)
+
+# Generalized Additive Models
 library(mgcv)
 ```
 
-```{r}
-library(readr)
-df <- read_csv("C:/Users/lamin/Downloads/crime_prediction_dataset.csv")
-df
+---
+
+## 2 — Data
+
+```{r load-or-generate-data}
+# ---------------------------------------------------------------------------
+# Try to load the real dataset from a local (relative) path.
+# If the file is not present — e.g. when running on GitHub Actions — we
+# generate a synthetic dataset that has the same structure so that the rest
+# of the notebook runs end-to-end without modification.
+# ---------------------------------------------------------------------------
+
+data_file <- "crime_prediction_dataset.csv"
+
+if (file.exists(data_file)) {
+  # Load the real dataset
+  df <- read_csv(data_file, show_col_types = FALSE)
+  message("Loaded real dataset: ", nrow(df), " rows.")
+} else {
+  # ---- Synthetic data generation ----------------------------------------
+  # Replace this block with your own data once you place the CSV in the
+  # repository root (or adjust `data_file` to point to it).
+  message("Real dataset not found. Generating synthetic crime data for demonstration.")
+
+  set.seed(42)
+  n_crimes <- 600
+
+  # Partition crimes across three groups:
+  #   40 % cluster near (0.25, 0.30) — hotspot A (e.g. a city centre)
+  #   40 % cluster near (0.75, 0.70) — hotspot B (e.g. a second district)
+  #   20 % random background noise
+  n1 <- round(n_crimes * 0.40)
+  n2 <- round(n_crimes * 0.40)
+  n3 <- n_crimes - n1 - n2
+
+  df <- tibble(
+    masked_longitude = c(
+      rnorm(n1, mean = 0.25, sd = 0.07),   # hotspot A
+      rnorm(n2, mean = 0.75, sd = 0.09),   # hotspot B
+      runif(n3, 0, 1)                        # background
+    ),
+    masked_latitude = c(
+      rnorm(n1, mean = 0.30, sd = 0.07),
+      rnorm(n2, mean = 0.70, sd = 0.09),
+      runif(n3, 0, 1)
+    )
+  ) %>%
+    mutate(
+      # Clip coordinates to the valid masked range [0, 1]
+      masked_longitude = pmin(pmax(masked_longitude, 0), 1),
+      masked_latitude  = pmin(pmax(masked_latitude,  0), 1),
+
+      # Continuous time of day (hours, 0–24)
+      time_of_crime = runif(n_crimes, 0, 24),
+
+      # Study day index (1–14, representing two weeks of data)
+      day_of_crime  = sample(1:14, n_crimes, replace = TRUE)
+    )
+  # -----------------------------------------------------------------------
+}
 ```
 
-
-
-```{r}
+```{r eda}
+# Quick structural overview of the dataset
 str(df)
 ```
-```{r}
-# --- STEP 1: DEFINE THE GRID BOUNDARIES ---
-# Your coordinates are masked (between 0 and 1). We will create a 20x20 grid.
-lon_breaks <- seq(0, 1, length.out = 11) 
-lat_breaks <- seq(0, 1, length.out = 11)
 
-# Time is in hours (0 to 24). We will create 24 1-hour intervals.
-time_breaks <- seq(0, 24, by = 1)
+---
+
+## 3 — Define the Spatial and Temporal Grid
+
+```{r define-grid}
+# ---------------------------------------------------------------------------
+# STEP 1: DEFINE THE GRID BOUNDARIES
+# ---------------------------------------------------------------------------
+# Coordinates are masked to [0, 1].  We discretise them into a 10×10 grid
+# (11 break points → 10 bins per axis).
+lon_breaks  <- seq(0, 1, length.out = 11)   # 10 longitude bins
+lat_breaks  <- seq(0, 1, length.out = 11)   # 10 latitude bins
+
+# Time of day runs 0–24 h; we use 24 one-hour bins.
+time_breaks <- seq(0, 24, by = 1)           # 24 time-of-day bins
+
+# Compute the centre coordinate of each bin so the GAM works with
+# continuous (rather than integer-index) values.
+lon_centers  <- head(lon_breaks,  -1) + diff(lon_breaks)  / 2
+lat_centers  <- head(lat_breaks,  -1) + diff(lat_breaks)  / 2
+time_centers <- head(time_breaks, -1) + diff(time_breaks) / 2
 ```
 
-```{r}
+---
 
-# Discretize the raw data into bins
+## 4 — Map Raw Events to Grid Cells
+
+```{r map-to-grid}
+# ---------------------------------------------------------------------------
+# STEP 2: MAP RAW DATA TO THE GRID  (grid indices s_i and t_j)
+# ---------------------------------------------------------------------------
+# Each crime event is assigned to the nearest grid cell (x, y) and time bin.
 df_binned <- df %>%
   mutate(
-    lon_bin = cut(masked_longitude, breaks = num_lon_bins, labels = FALSE),
-    lat_bin = cut(masked_latitude, breaks = num_lat_bins, labels = FALSE),
-    time_bin = cut(time_of_crime, breaks = time_breaks, labels = FALSE, include.lowest = TRUE)
-  )
-```
-
-
-```{r}
-# Get the midpoints of the bins to use as features in the GAM
-lon_midpoints <- seq(min(df$masked_longitude), max(df$masked_longitude), length.out = num_lon_bins)
-lat_midpoints <- seq(min(df$masked_latitude), max(df$masked_latitude), length.out = num_lat_bins)
-time_midpoints <- seq(0.5, 23.5, by = 1)
-
-# Get the center points of these grids so the GAM has continuous numbers to work with
-lon_centers <- head(lon_breaks, -1) + diff(lon_breaks)/2
-lat_centers <- head(lat_breaks, -1) + diff(lat_breaks)/2
-time_centers <- head(time_breaks, -1) + diff(time_breaks)/2
-
-```
-
-
-```{r}
-# --- STEP 2: MAP RAW DATA TO THE GRID (Equation: s_i, t_j) ---
-df_binned <- df %>%
-  mutate(
-    # Map masked_longitude and masked_latitude to grid indices (1 to 20)
-    grid_x_index = as.numeric(cut(masked_longitude, breaks = lon_breaks, include.lowest = TRUE)),
-    grid_y_index = as.numeric(cut(masked_latitude, breaks = lat_breaks, include.lowest = TRUE)),
-    
-    # Map time_of_crime to time indices (1 to 24)
-    time_index = as.numeric(cut(time_of_crime, breaks = time_breaks, include.lowest = TRUE))
+    # Longitude → column index 1..10
+    grid_x_index = as.numeric(cut(masked_longitude, breaks = lon_breaks,
+                                  include.lowest = TRUE)),
+    # Latitude  → row index 1..10
+    grid_y_index = as.numeric(cut(masked_latitude,  breaks = lat_breaks,
+                                  include.lowest = TRUE)),
+    # Hour      → time-bin index 1..24
+    time_index   = as.numeric(cut(time_of_crime,    breaks = time_breaks,
+                                  include.lowest = TRUE))
   ) %>%
-  
-    # Remove any NA values in case a data point falls exactly outside the 0-1 or 0-24 boundaries
+  # Drop rows where a coordinate falls exactly outside the grid boundaries
   drop_na(grid_x_index, grid_y_index, time_index)
 
-# Aggregate to find where crimes ACTUALLY happened (incident = 1)
+# Aggregate: count how many crimes occurred in each (cell, day, hour) combination.
+# Mark each observed cell as incident = 1.
 actual_crimes <- df_binned %>%
   group_by(grid_x_index, grid_y_index, day_of_crime, time_index) %>%
   summarise(crime_count = n(), .groups = "drop") %>%
-  mutate(incident = 1) 
+  mutate(incident = 1L)
 ```
 
+---
 
-```{r}
-# --- STEP 3: CREATE THE BACKGROUND (0s) ---
-# We must generate all possible grid/time combinations to represent places/times with NO crime
+## 5 — Build the Full Grid with Background Zeros
+
+```{r build-full-grid}
+# ---------------------------------------------------------------------------
+# STEP 3: CREATE THE BACKGROUND (incident = 0)
+# ---------------------------------------------------------------------------
+# A GAM with a binary response requires both positive cases (crimes) and
+# negative cases (no crime).  We expand every combination of location, day,
+# and time and label unobserved cells as incident = 0.
+
 all_days <- unique(df$day_of_crime)
 
-# expand_grid creates every possible combination of location and time
+# Cartesian product of all grid cells × days × time bins
 full_grid <- expand_grid(
-  grid_x_index = 1:20,
-  grid_y_index = 1:20,
+  grid_x_index = seq_along(lon_centers),   # 1..10
+  grid_y_index = seq_along(lat_centers),   # 1..10
   day_of_crime = all_days,
-  time_index = 1:24
+  time_index   = seq_along(time_centers)   # 1..24
 )
 
-# Merge actual crimes onto the full grid. If a cell has no crime, incident = 0
+# Left-join actual crimes onto the full grid; missing cells get incident = 0.
 model_data <- full_grid %>%
-  left_join(actual_crimes, by = c("grid_x_index", "grid_y_index", "day_of_crime", "time_index")) %>%
+  left_join(actual_crimes,
+            by = c("grid_x_index", "grid_y_index", "day_of_crime", "time_index")) %>%
   mutate(
-    incident = replace_na(incident, 0), # 1 if crime happened, 0 if not
-    
-    # Assign the physical center coordinates back to the grid for the GAM to use
+    incident = replace_na(incident, 0L),   # 1 = crime observed, 0 = no crime
+
+    # Replace integer indices with the physical centre coordinates so the
+    # GAM smooths over continuous space/time rather than arbitrary integers.
     grid_longitude = lon_centers[grid_x_index],
     grid_latitude  = lat_centers[grid_y_index],
     grid_time      = time_centers[time_index]
   )
+
+cat("model_data dimensions:", nrow(model_data), "rows ×", ncol(model_data), "cols\n")
+cat("Prevalence (% cells with a crime):",
+    round(100 * mean(model_data$incident), 2), "%\n")
 ```
 
+---
 
-```{r}
-# --- STEP 4: FIT THE GAM MODEL ---
-# We predict the probability of 'incident' (0 or 1) using the grid variables
+## 6 — Fit the GAM
+
+```{r fit-gam}
+# ---------------------------------------------------------------------------
+# STEP 4: FIT THE GENERALIZED ADDITIVE MODEL
+# ---------------------------------------------------------------------------
+# Response  : incident (binary 0/1)  → family = binomial(logit)
+# Predictors:
+#   te(grid_longitude, grid_latitude, k=5) — 2-D spatial smooth (hotspot map)
+#   s(day_of_crime, k=5)                   — overall temporal trend
+#   s(grid_time, bs="cc", k=5)             — cyclic time-of-day effect
+# Fitting is done via REML (Restricted Maximum Likelihood) which gives
+# well-calibrated smoothing parameters.
+
 gam_model <- gam(
-  incident ~ te(grid_longitude, grid_latitude, k = 5) +  # 2D Spatial Hot Spot
-             s(day_of_crime, k = 5) +                     # Day trend
-             s(grid_time, bs = "cc", k = 5),             # Time of day (Cyclic)
+  incident ~ te(grid_longitude, grid_latitude, k = 5) +
+             s(day_of_crime, k = 5) +
+             s(grid_time, bs = "cc", k = 5),
   family = binomial(link = "logit"),
-  data = model_data,
+  data   = model_data,
   method = "REML"
 )
 ```
 
-```{r}
+---
+
+## 7 — Model Summary
+
+```{r model-summary}
+# Print the GAM summary:
+#   - Parametric coefficients  (intercept)
+#   - Approximate significance of smooth terms (edf, F, p-value)
+#   - R-sq.(adj), deviance explained, REML score, GCV
 summary(gam_model)
+```
+
+```{r plot-smooths, fig.width=8, fig.height=4}
+# Visualise the estimated smooth effects.
+# Each panel shows the partial effect on the log-odds of a crime.
+par(mfrow = c(1, 3))
+plot(gam_model, pages = 0, shade = TRUE, seWithMean = TRUE,
+     main = "GAM Smooth Effects")
+par(mfrow = c(1, 1))
 ```
 
