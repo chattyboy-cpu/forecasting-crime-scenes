@@ -1,0 +1,131 @@
+---
+title: "Generative Additive Model"
+author: ',Chatty'
+date: "2026-03-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# Load required libraries
+library(tidyverse)
+library(dplyr)
+library(mgcv)
+```
+
+```{r}
+library(readr)
+df <- read_csv("C:/Users/lamin/Downloads/crime_prediction_dataset.csv")
+df
+```
+
+
+
+```{r}
+str(df)
+```
+```{r}
+# --- STEP 1: DEFINE THE GRID BOUNDARIES ---
+# Your coordinates are masked (between 0 and 1). We will create a 20x20 grid.
+lon_breaks <- seq(0, 1, length.out = 11) 
+lat_breaks <- seq(0, 1, length.out = 11)
+
+# Time is in hours (0 to 24). We will create 24 1-hour intervals.
+time_breaks <- seq(0, 24, by = 1)
+```
+
+```{r}
+
+# Discretize the raw data into bins
+df_binned <- df %>%
+  mutate(
+    lon_bin = cut(masked_longitude, breaks = num_lon_bins, labels = FALSE),
+    lat_bin = cut(masked_latitude, breaks = num_lat_bins, labels = FALSE),
+    time_bin = cut(time_of_crime, breaks = time_breaks, labels = FALSE, include.lowest = TRUE)
+  )
+```
+
+
+```{r}
+# Get the midpoints of the bins to use as features in the GAM
+lon_midpoints <- seq(min(df$masked_longitude), max(df$masked_longitude), length.out = num_lon_bins)
+lat_midpoints <- seq(min(df$masked_latitude), max(df$masked_latitude), length.out = num_lat_bins)
+time_midpoints <- seq(0.5, 23.5, by = 1)
+
+# Get the center points of these grids so the GAM has continuous numbers to work with
+lon_centers <- head(lon_breaks, -1) + diff(lon_breaks)/2
+lat_centers <- head(lat_breaks, -1) + diff(lat_breaks)/2
+time_centers <- head(time_breaks, -1) + diff(time_breaks)/2
+
+```
+
+
+```{r}
+# --- STEP 2: MAP RAW DATA TO THE GRID (Equation: s_i, t_j) ---
+df_binned <- df %>%
+  mutate(
+    # Map masked_longitude and masked_latitude to grid indices (1 to 20)
+    grid_x_index = as.numeric(cut(masked_longitude, breaks = lon_breaks, include.lowest = TRUE)),
+    grid_y_index = as.numeric(cut(masked_latitude, breaks = lat_breaks, include.lowest = TRUE)),
+    
+    # Map time_of_crime to time indices (1 to 24)
+    time_index = as.numeric(cut(time_of_crime, breaks = time_breaks, include.lowest = TRUE))
+  ) %>%
+  
+    # Remove any NA values in case a data point falls exactly outside the 0-1 or 0-24 boundaries
+  drop_na(grid_x_index, grid_y_index, time_index)
+
+# Aggregate to find where crimes ACTUALLY happened (incident = 1)
+actual_crimes <- df_binned %>%
+  group_by(grid_x_index, grid_y_index, day_of_crime, time_index) %>%
+  summarise(crime_count = n(), .groups = "drop") %>%
+  mutate(incident = 1) 
+```
+
+
+```{r}
+# --- STEP 3: CREATE THE BACKGROUND (0s) ---
+# We must generate all possible grid/time combinations to represent places/times with NO crime
+all_days <- unique(df$day_of_crime)
+
+# expand_grid creates every possible combination of location and time
+full_grid <- expand_grid(
+  grid_x_index = 1:20,
+  grid_y_index = 1:20,
+  day_of_crime = all_days,
+  time_index = 1:24
+)
+
+# Merge actual crimes onto the full grid. If a cell has no crime, incident = 0
+model_data <- full_grid %>%
+  left_join(actual_crimes, by = c("grid_x_index", "grid_y_index", "day_of_crime", "time_index")) %>%
+  mutate(
+    incident = replace_na(incident, 0), # 1 if crime happened, 0 if not
+    
+    # Assign the physical center coordinates back to the grid for the GAM to use
+    grid_longitude = lon_centers[grid_x_index],
+    grid_latitude  = lat_centers[grid_y_index],
+    grid_time      = time_centers[time_index]
+  )
+```
+
+
+```{r}
+# --- STEP 4: FIT THE GAM MODEL ---
+# We predict the probability of 'incident' (0 or 1) using the grid variables
+gam_model <- gam(
+  incident ~ te(grid_longitude, grid_latitude, k = 5) +  # 2D Spatial Hot Spot
+             s(day_of_crime, k = 5) +                     # Day trend
+             s(grid_time, bs = "cc", k = 5),             # Time of day (Cyclic)
+  family = binomial(link = "logit"),
+  data = model_data,
+  method = "REML"
+)
+```
+
+```{r}
+summary(gam_model)
+```
+
